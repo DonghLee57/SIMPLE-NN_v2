@@ -1,11 +1,22 @@
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim.lr_scheduler import ExponentialLR
 import time, os
 from tqdm import tqdm
 from simple_nn.models import neural_network, loss, data_handler, optimizers, logger
 
+def setup_ddp(rank, world_size):
+    """Set up the process group for DDP."""
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+
+def cleanup_ddp():
+    """Clean up the process group."""
+    dist.destroy_process_group()
 #Main function that train neural network
 def train(inputs, logfile, comm):
+    setup_ddp(rank, world_size)
+    
     start_time = time.time()
 
     if inputs['neural_network']['double_precision']:
@@ -13,24 +24,43 @@ def train(inputs, logfile, comm):
     device = _get_torch_device(inputs)
 
     model = neural_network._initialize_model_and_weights(inputs, logfile, device)
+    model = DDP(model, device_ids=None)
     optimizer = optimizers._initialize_optimizer(inputs, model)
     criterion = torch.nn.MSELoss(reduction='none').to(device=device)
 
-    checkpoint = _load_model_weights_and_optimizer_from_checkpoint(inputs, logfile, model, optimizer, device)
+    checkpoint = _load_model_weights_and_optimizer_from_checkpoint(inputs, logfile, model.module, optimizer, device)
     scale_factor, pca = _load_scale_factor_and_pca(inputs, logfile, checkpoint)
     loss = _set_initial_loss(inputs, logfile, checkpoint)
 
     if inputs['neural_network']['train']:
-        train_loader = data_handler._load_dataset(inputs, logfile, scale_factor, pca, device, mode='train', gdf=inputs['neural_network']['use_atomic_weights'])
+        # Load training and validation data loaders
+        train_loader = data_handler._load_dataset(inputs, logfile, scale_factor, pca, device,
+                                                  mode='train', gdf=inputs['neural_network']['use_atomic_weights'])
         if os.path.exists(inputs['neural_network']['valid_list']):
-            valid_loader = data_handler._load_dataset(inputs, logfile, scale_factor, pca, device, mode='valid', gdf=False)
+            valid_loader = data_handler._load_dataset(inputs, logfile, scale_factor, pca,
+                                                      device, mode='valid', gdf=False)
         else:
             valid_loader = None
-        train_model(inputs, logfile, model, optimizer, criterion, scale_factor, pca, device, loss, train_loader, valid_loader)
+        # Train the model
+        train_model(inputs, logfile, model, optimizer, criterion,
+                    scale_factor, pca, device,
+                    loss, train_loader,
+                    valid_loader)
 
     elif inputs['neural_network']['test']:
-        test_loader = data_handler._load_dataset(inputs, logfile, scale_factor, pca, device, mode='test', gdf=False)
-        test_model(inputs, logfile, model, optimizer, criterion, device, test_loader)
+        test_loader = data_handler._load_dataset(inputs, logfile,
+                                                 scale_factor,
+                                                 pca,
+                                                 device,
+                                                 mode='test',
+                                                 gdf=False)
+        test_model(inputs,
+                   logfile,
+                   model.module,
+                   optimizer,
+                   criterion,
+                   device,
+                   test_loader)
 
     elif inputs['neural_network']['add_NNP_ref']:
         ref_loader = data_handler._load_dataset(inputs, logfile, scale_factor, pca, device, mode='add_NNP_ref')
@@ -51,7 +81,8 @@ def train(inputs, logfile, comm):
     else:
         if comm.rank == 0:
             logfile.write(f"Please choose one of the running modes\n")
-
+            
+    cleanup_ddp()
     if comm.rank == 0:
         logfile.write(f"Elapsed time in training: {time.time()-start_time:10} s.\n")
         logfile.write("{}\n".format('-'*88))
