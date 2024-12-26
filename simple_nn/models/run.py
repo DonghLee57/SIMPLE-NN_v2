@@ -13,6 +13,7 @@ def setup_ddp(rank, world_size):
 def cleanup_ddp():
     """Clean up the process group."""
     dist.destroy_process_group()
+
 #Main function that train neural network
 def train(inputs, logfile, comm):
     setup_ddp(rank, world_size)
@@ -196,7 +197,7 @@ def train_model(inputs, logfile, model, optimizer, criterion, scale_factor, pca,
             valid_epoch_result = None
             loss = train_loss
 
-        if (epoch % inputs['neural_network']['show_interval'] == 0):
+        if (epoch % inputs['neural_network']['show_interval'] == 0) and dist.get_rank() == 0:
             if inputs['neural_network']['accurate_train_rmse']:
                 recalc_epoch_result = progress_epoch(inputs, train_loader, struct_labels, model, optimizer, criterion, epoch, dtype, device, non_block, valid=True, atomic_e=atomic_e)
                 update_recalc_results(train_epoch_result, recalc_epoch_result)
@@ -206,20 +207,25 @@ def train_model(inputs, logfile, model, optimizer, criterion, scale_factor, pca,
             if inputs['neural_network']['print_structure_rmse']:
                 logger._show_structure_rmse(logfile, train_epoch_result, valid_epoch_result)
 
-        if loss < best_loss:
-            best_loss = loss
-            best_epoch = epoch
-            save_checkpoint(epoch, loss, model, optimizer, pca, scale_factor, filename=f'checkpoint_bestmodel.pth.tar')
-            model.write_lammps_potential(filename='./potential_saved_bestmodel', inputs=inputs, scale_factor=scale_factor, pca=pca)
+        if dist.get_rank() == 0:
+            if loss < best_loss:
+                best_loss = loss
+                best_epoch = epoch
+                save_checkpoint(epoch, loss, model, optimizer, pca, scale_factor, filename=f'checkpoint_bestmodel.pth.tar')
+                model.module.write_lammps_potential(filename='./potential_saved_bestmodel', inputs=inputs, scale_factor=scale_factor, pca=pca)
 
+        best_loss = torch.tensor(best_loss, device=device)
+        dist.all_reduce(best_loss, op=dist.ReduceOp.MIN)
+        best_loss = best_loss.item()
+        
         # save checkpoint for each save_interval
         if inputs['neural_network']['save_interval'] and (epoch % inputs['neural_network']['save_interval'] == 0):
             save_checkpoint(epoch, loss, model, optimizer, pca, scale_factor, filename=f'checkpoint_epoch_{epoch}.pth.tar')
-            model.write_lammps_potential(filename='./potential_saved_epoch_{0}'.format(epoch), inputs=inputs, scale_factor=scale_factor, pca=pca)
+            model.module.write_lammps_potential(filename='./potential_saved_epoch_{0}'.format(epoch), inputs=inputs, scale_factor=scale_factor, pca=pca)
             logfile.write("Lammps potential written at {0} epoch\n".format(epoch))
         elif not inputs['neural_network']['save_interval']:
             save_checkpoint(epoch, loss, model, optimizer, pca, scale_factor, filename='checkpoint_latest.pth.tar')
-            model.write_lammps_potential(filename='./potential_saved_latest', inputs=inputs, scale_factor=scale_factor, pca=pca)
+            model.module.write_lammps_potential(filename='./potential_saved_latest', inputs=inputs, scale_factor=scale_factor, pca=pca)
 
         # Break if energy, force, and stress are under their criteria
         if criteria_dict:
@@ -231,7 +237,7 @@ def train_model(inputs, logfile, model, optimizer, criterion, scale_factor, pca,
             if breaksignal:
                 logfile.write("Break point reached. Terminating training model\n")
                 save_checkpoint(epoch, loss, model, optimizer, pca, scale_factor, filename='checkpoint_criterion.pth.tar')
-                model.write_lammps_potential(filename='./potential_saved_criterion', inputs=inputs, scale_factor=scale_factor, pca=pca)
+                model.module.write_lammps_potential(filename='./potential_saved_criterion', inputs=inputs, scale_factor=scale_factor, pca=pca)
                 logfile.write("checkpoint_criterion.pth.tar & potential_saved_criterion written\n")
                 break
 
@@ -242,12 +248,12 @@ def train_model(inputs, logfile, model, optimizer, criterion, scale_factor, pca,
             os.remove('./stoptrain')
             logfile.write("Stop traning by ./stoptrain file.\n")
             save_checkpoint(epoch, loss, model, optimizer, pca, scale_factor, filename='checkpoint_stoptrain.pth.tar')
-            model.write_lammps_potential(filename='./potential_saved_stoptrain', inputs=inputs, scale_factor=scale_factor, pca=pca)
+            model.module.write_lammps_potential(filename='./potential_saved_stoptrain', inputs=inputs, scale_factor=scale_factor, pca=pca)
             logfile.write("checkpoint_stoptrain.pth.tar & potential_saved_stoptrain written\n")
             break
 
         logfile.flush()
-
+    dist.barrier()
     logfile.write("Best loss lammps potential written at {0} epoch\n".format(best_epoch))
 
 # Evalutaion model & save result  -> test_result
@@ -347,15 +353,17 @@ def update_recalc_results(train_result, recalc_result):
     train_result['data_time'].val += recalc_result['data_time'].val
 
 def save_checkpoint(epoch, loss, model, optimizer, pca, scale_factor, filename):
-    state ={'epoch': epoch + 1,
+    if dist.get_rank() == 0:
+        state = {
+            'epoch': epoch + 1,
             'loss': loss,
-            'model': model.state_dict(),
+            'model': model.module.state_dict(),
             'optimizer': optimizer.state_dict(),
             'pca': pca,
             'scale_factor': scale_factor,
-            #'scheduler': scheduler.state_dict()
-            }
-    torch.save(state, filename)
+        }
+        torch.save(state, filename)
+    dist.barrier()
 
 def _get_structure_labels(train_loader, valid_loader=None):
     labels = []
