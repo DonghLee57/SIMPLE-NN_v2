@@ -1,4 +1,5 @@
 import torch
+from torch.utils.data.distributed import DistributedSampler
 import numpy as np
 import os
 from functools import partial
@@ -227,7 +228,8 @@ def _make_dataloader(inputs, dataset_list, scale_factor, pca, device, use_force,
     else:
         batch_size = len(dataset_list) if inputs['neural_network']['full_batch'] else inputs['neural_network']['batch_size']
         shuffle = False if valid else inputs['neural_network']['shuffle_dataloader']
-
+        sampler = DistributedSampler(dataset_list)
+        
         if gdf == None:
             partial_collate = partial(my_collate, atom_types=inputs['atom_types'], device=device,\
             scale_factor=scale_factor, pca=pca,  pca_min_whiten_level=pca['pca_whiten'] if inputs['neural_network']['use_pca'] else None,\
@@ -239,7 +241,7 @@ def _make_dataloader(inputs, dataset_list, scale_factor, pca, device, use_force,
             use_force=use_force, use_stress=use_stress, gdf_scaler=gdf)
       
         data_loader = torch.utils.data.DataLoader(\
-            dataset_list, batch_size=batch_size, shuffle=shuffle, collate_fn=partial_collate,\
+            dataset_list, batch_size=batch_size, shuffle=shuffle, sampler=sampler, collate_fn=partial_collate,\
             num_workers=inputs['neural_network']['subprocesses'], pin_memory=False)
 
     return data_loader
